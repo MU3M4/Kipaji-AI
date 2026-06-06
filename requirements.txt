@@ -6,7 +6,7 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 
 # Google AI + Cloud
-google-genai==0.8.0
+google-genai
 google-cloud-firestore==2.18.0
 
 # Data validation

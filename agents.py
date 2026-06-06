@@ -1,11 +1,5 @@
 """
 agents.py — Kipaji-AI core agent pipeline
-
-Two agents run in strict sequence:
-  1. run_bias_mitigation_guardrail  — strips proxy variables, returns sanitized text + typed TradeEvents
-  2. run_kipaji_underwriter_core    — scores velocity from typed events, produces credit decision
-
-Inter-agent contract is enforced via Pydantic models — no free-form LLM-to-LLM passing.
 """
 
 import os
@@ -28,11 +22,10 @@ MODEL_ID = "gemini-1.5-flash"
 class TradeEvent(BaseModel):
     event_type: Literal["revenue", "expense", "inventory_in", "debt_repayment", "receivable", "unknown"]
     amount_ksh: Optional[float] = None
-    frequency_signal: Optional[str] = None   # "daily", "weekly", "market_day", "irregular"
+    frequency_signal: Optional[str] = None
     confidence: float = Field(ge=0.0, le=1.0)
     raw_utterance: str
-    bias_flags: List[str] = []               # proxy variables the guardrail stripped
-
+    bias_flags: List[str] = []
 
 class SanitizedInput(BaseModel):
     cleaned_text: str
@@ -40,53 +33,48 @@ class SanitizedInput(BaseModel):
     language: str
     low_confidence_count: int
     overall_confidence: float
-    bias_proxy_removed: List[str]            # audit: what was stripped
-
+    bias_proxy_removed: List[str]
 
 class CreditDecision(BaseModel):
     approved: bool
-    approved_local: float                    # KSH
+    approved_local: float
     credit_tier: Literal["micro", "small", "medium", "declined"]
     interest_rate_monthly: float
     repayment_days: int
-    velocity_score: float                    # 0–100
-    consistency_score: float                 # 0–1
+    velocity_score: float
+    consistency_score: float
     confidence_gate_triggered: bool
     decision_reason: str
     audit_trail: List[str]
-    response_message: str                    # merchant-facing, in their language
+    response_message: str
     timestamp: str
 
-
 # ---------------------------------------------------------------------------
-# SHARED GEMINI CALL HELPER  (wraps blocking SDK in thread pool)
+# SHARED GEMINI CALL HELPER (FIXED)
 # ---------------------------------------------------------------------------
 
 async def _gemini_generate(client, prompt: str, system: str = "") -> str:
     """
-    Wraps the synchronous Gemini generate_content call in asyncio.to_thread
-    so it never blocks the FastAPI event loop.
-    Returns the raw text string.
+    Wraps the synchronous Gemini generate_content call in asyncio.to_thread.
     """
     from google.genai import types
 
-    contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
     config = types.GenerateContentConfig(
         system_instruction=system,
-        temperature=0.1,         # low temp for deterministic structured extraction
+        temperature=0.1,
         max_output_tokens=1500,
     )
 
     def _blocking_call():
+        # FIX: Pass the prompt string directly. The SDK handles the Content/Part wrapping.
         response = client.models.generate_content(
             model=MODEL_ID,
-            contents=contents,
+            contents=prompt,
             config=config,
         )
         return response.text
 
     return await asyncio.to_thread(_blocking_call)
-
 
 # ---------------------------------------------------------------------------
 # AGENT 1 — BIAS MITIGATION GUARDRAIL
@@ -100,7 +88,7 @@ Your job is to:
 2. Identify and remove ANY proxy variables that could introduce demographic bias
 3. Return ONLY structured JSON — no prose, no markdown, no preamble
 
-PROXY VARIABLES TO REMOVE (these correlate with protected attributes):
+PROXY VARIABLES TO REMOVE:
 - Location names that signal ethnicity or socioeconomic status (replace with "market area")
 - Gender-coded business descriptors ("mama mboga" → "vegetable vendor")
 - Tribal/ethnic markers in any language
@@ -110,7 +98,7 @@ PROXY VARIABLES TO REMOVE (these correlate with protected attributes):
 TRADE EVENT TYPES:
 - revenue: money received from sales
 - expense: money paid out for business costs
-- inventory_in: stock/goods acquired (may or may not have price)
+- inventory_in: stock/goods acquired
 - debt_repayment: paying back a loan or credit
 - receivable: money owed TO the merchant
 - unknown: cannot determine type with confidence
@@ -141,18 +129,12 @@ CONFIDENCE RULES:
 - If input has NO extractable trade events, return one event with type "unknown" and confidence 0.0
 """
 
-
 async def run_bias_mitigation_guardrail(
     raw_message: str,
     merchant_id: str,
     language: str,
     ai_client=None,
 ) -> SanitizedInput:
-    """
-    Agent 1: Strips demographic proxy variables and extracts typed trade events.
-    Returns a validated SanitizedInput. Falls back to a safe default if Gemini
-    is unavailable or returns malformed JSON.
-    """
     if ai_client is None:
         logger.warning(f"[{merchant_id}] Guardrail running without AI client — using fallback")
         return _guardrail_fallback(raw_message, language)
@@ -169,12 +151,15 @@ Extract all trade events and apply bias filtering. Return only the JSON object.
     try:
         raw_response = await _gemini_generate(ai_client, prompt, system=BIAS_GUARDRAIL_SYSTEM)
 
-        # Strip any accidental markdown fences
+        # FIX: Bulletproof JSON extraction. Finds the first '{' and the last '}'
         clean = raw_response.strip()
-        if clean.startswith("```"):
-            clean = clean.split("```")[1]
-            if clean.startswith("json"):
-                clean = clean[4:]
+        start = clean.find('{')
+        end = clean.rfind('}')
+        
+        if start != -1 and end != -1 and end > start:
+            clean = clean[start:end+1]
+        else:
+            raise ValueError(f"No JSON object found in response")
 
         data = json.loads(clean)
         sanitized = SanitizedInput(**data)
@@ -186,13 +171,11 @@ Extract all trade events and apply bias filtering. Return only the JSON object.
         )
         return sanitized
 
-    except (json.JSONDecodeError, Exception) as e:
+    except Exception as e:
         logger.error(f"[{merchant_id}] Guardrail parse error: {e} — using fallback")
         return _guardrail_fallback(raw_message, language)
 
-
 def _guardrail_fallback(raw_message: str, language: str) -> SanitizedInput:
-    """Safe fallback when Gemini is unavailable — returns an unknown event with low confidence."""
     return SanitizedInput(
         cleaned_text=raw_message,
         detected_trade_events=[
@@ -210,7 +193,6 @@ def _guardrail_fallback(raw_message: str, language: str) -> SanitizedInput:
         bias_proxy_removed=[],
     )
 
-
 # ---------------------------------------------------------------------------
 # AGENT 2 — KIPAJI UNDERWRITER CORE
 # ---------------------------------------------------------------------------
@@ -227,7 +209,6 @@ YOUR MANDATE:
 - Base credit decisions ONLY on trade velocity and consistency — NOT on demographics
 - Prioritise access: lean toward approval for borderline cases where velocity signals are positive
 - Never penalise merchants for having no formal banking history
-- Explain decisions in simple, respectful language in the merchant's language
 
 CREDIT TIERS (in KSH):
 - micro:  500–2,000    (new merchants or low velocity)
@@ -235,17 +216,9 @@ CREDIT TIERS (in KSH):
 - medium: 8,001–25,000 (high velocity, proven consistency)
 - declined: 0          (insufficient signal or very low confidence)
 
-SCORING:
-- velocity_score (0–100): weighted by 7-day total and trend direction
-- consistency_score (0–1): from the variance metric (1 = perfectly consistent)
-- Confidence gate: if overall_confidence < 0.65, reduce approved amount by 50% and flag it
-
 INTEREST RATES:
-- micro: 4% monthly
-- small: 3.5% monthly  
-- medium: 3% monthly
-
-REPAYMENT: 7 days for micro, 14 days for small, 21 days for medium
+- micro: 4% monthly, small: 3.5% monthly, medium: 3% monthly
+- REPAYMENT: 7 days for micro, 14 days for small, 21 days for medium
 
 Return ONLY this JSON — no prose, no markdown:
 {
@@ -263,7 +236,6 @@ Return ONLY this JSON — no prose, no markdown:
 }
 """
 
-
 async def run_kipaji_underwriter_core(
     sanitized: SanitizedInput,
     history: List[Dict[str, Any]],
@@ -272,17 +244,10 @@ async def run_kipaji_underwriter_core(
     merchant_id: str,
     ai_client=None,
 ) -> CreditDecision:
-    """
-    Agent 2: Scores the sanitized trade events against merchant history.
-    Applies confidence gate before scoring.
-    Returns a validated CreditDecision.
-    """
-    # CONFIDENCE GATE — route to clarification before Gemini call
     if sanitized.overall_confidence < 0.65:
         logger.info(f"[{merchant_id}] Confidence gate triggered ({sanitized.overall_confidence:.2f})")
         return _low_confidence_decision(sanitized, merchant_id)
 
-    # Only pass revenue and receivable events to scorer — not expenses or debt repayments
     revenue_events = [
         e for e in sanitized.detected_trade_events
         if e.event_type in ("revenue", "receivable") and e.amount_ksh
@@ -316,11 +281,15 @@ Make a credit decision based solely on trade velocity signals. Return only the J
     try:
         raw_response = await _gemini_generate(ai_client, prompt, system=UNDERWRITER_SYSTEM)
 
+        # FIX: Bulletproof JSON extraction
         clean = raw_response.strip()
-        if clean.startswith("```"):
-            clean = clean.split("```")[1]
-            if clean.startswith("json"):
-                clean = clean[4:]
+        start = clean.find('{')
+        end = clean.rfind('}')
+        
+        if start != -1 and end != -1 and end > start:
+            clean = clean[start:end+1]
+        else:
+            raise ValueError(f"No JSON object found in response")
 
         data = json.loads(clean)
         data["timestamp"] = datetime.utcnow().isoformat()
@@ -334,16 +303,15 @@ Make a credit decision based solely on trade velocity signals. Return only the J
         )
         return decision
 
-    except (json.JSONDecodeError, Exception) as e:
+    except Exception as e:
         logger.error(f"[{merchant_id}] Underwriter parse error: {e} — using rule-based fallback")
         return _rule_based_decision(revenue_events, velocity_metrics, sanitized.language, merchant_id)
 
+# ---------------------------------------------------------------------------
+# FALLBACKS & RULE-BASED SCORER
+# ---------------------------------------------------------------------------
 
 def _low_confidence_decision(sanitized: SanitizedInput, merchant_id: str) -> CreditDecision:
-    """
-    Returned when guardrail confidence is too low to score.
-    Asks the merchant for clarification rather than declining outright.
-    """
     lang = sanitized.language
     if lang == "sw":
         msg = "Samahani, hatukuelewa vizuri. Tafadhali tuambie: uliuza nini leo na bei ngapi?"
@@ -367,17 +335,12 @@ def _low_confidence_decision(sanitized: SanitizedInput, merchant_id: str) -> Cre
         timestamp=datetime.utcnow().isoformat(),
     )
 
-
 def _rule_based_decision(
     revenue_events: list,
     velocity_metrics: Dict[str, float],
     language: str,
     merchant_id: str,
 ) -> CreditDecision:
-    """
-    Deterministic fallback scorer when Gemini is unavailable.
-    Uses velocity metrics directly — no LLM dependency.
-    """
     avg_daily = velocity_metrics.get("avg_daily", 0)
     consistency = velocity_metrics.get("consistency", 0.5)
     total_7d = velocity_metrics.get("total_7d", 0)

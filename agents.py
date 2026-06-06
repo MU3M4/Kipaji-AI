@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger("KipajiAgents")
 
-MODEL_ID = "gemini-2.5-flash"
+MODEL_ID = "gemini-1.5-flash"
 
 # ---------------------------------------------------------------------------
 # TYPED INTER-AGENT CONTRACT

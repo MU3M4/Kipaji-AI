@@ -41,21 +41,40 @@ app = FastAPI(title="Kipaji Core AI", version="3.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # --- TELEMETRY HUB ---
+# --- TELEMETRY HUB (WITH HISTORY CACHE) ---
+telemetry_history = []
+MAX_HISTORY = 20
+
 class TelemetryHub:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
+        
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
+        
     def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections: self.active_connections.remove(websocket)
+        if websocket in self.active_connections: 
+            self.active_connections.remove(websocket)
+            
     async def broadcast(self, message: Dict[str, Any]):
+        # 1. Save to history cache (persists even if 0 connections are live)
+        telemetry_history.append(message)
+        if len(telemetry_history) > MAX_HISTORY:
+            telemetry_history.pop(0)
+            
+        # 2. Broadcast to live connections
+        if not self.active_connections: 
+            return
         payload = json.dumps(message, default=str)
         dead = []
         for conn in self.active_connections[:]:
-            try: await conn.send_text(payload)
-            except Exception: dead.append(conn)
-        for ws in dead: self.disconnect(ws)
+            try: 
+                await conn.send_text(payload)
+            except Exception: 
+                dead.append(conn)
+        for ws in dead: 
+            self.disconnect(ws)
 
 telemetry_hub = TelemetryHub()
 
@@ -63,8 +82,14 @@ telemetry_hub = TelemetryHub()
 async def websocket_telemetry(websocket: WebSocket):
     await telemetry_hub.connect(websocket)
     try:
-        while True: await websocket.receive_text()
-    except WebSocketDisconnect: telemetry_hub.disconnect(websocket)
+        # INSTANTLY send the history to the new client upon connection!
+        for msg in telemetry_history:
+            await websocket.send_text(json.dumps(msg, default=str))
+            
+        while True: 
+            await websocket.receive_text()
+    except WebSocketDisconnect: 
+        telemetry_hub.disconnect(websocket)
 
 async def _emit_audit(event_type: str, merchant_id: str, data: Dict[str, Any]):
     """Fire-and-forget telemetry emission with explicit logging for debugging."""

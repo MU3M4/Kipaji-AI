@@ -304,10 +304,9 @@ DASHBOARD_HTML = """
 async def read_root(): 
     return DASHBOARD_HTML
 
-@app.get("/health")
+@app.get("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"healthy": True, "checks": {"api": True, "gemini_configured": bool(gemini_client), "groq_configured": bool(groq_client)}, "timestamp": datetime.utcnow().isoformat()}
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), log_level="info")

@@ -1,21 +1,8 @@
-# Web framework
+# Kipaji-AI dependencies
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-
-# AI Client (Groq uses the OpenAI standard)
-openai==1.58.0
-
-
-# Data validation
+openai>=1.58.0
 pydantic==2.9.2
-
-# Session state
-redis==5.0.8
-
-# Language detection
 langdetect==1.0.9
-
-# Environment
 python-dotenv==1.0.1
-
-python-multipart
+python-multipart==0.0.9

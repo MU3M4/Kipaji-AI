@@ -1,7 +1,6 @@
 """
 agents.py — Kipaji-AI core agent pipeline (Groq Llama 3.3 Edition)
 """
-import os
 import json
 import asyncio
 import logging
@@ -12,12 +11,8 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger("KipajiAgents")
 
-# Groq Llama 3.3 70B - extremely fast and excellent at JSON extraction
 MODEL_ID = "llama-3.3-70b-versatile"
 
-# ---------------------------------------------------------------------------
-# TYPED INTER-AGENT CONTRACT
-# ---------------------------------------------------------------------------
 class TradeEvent(BaseModel):
     event_type: Literal["revenue", "expense", "inventory_in", "debt_repayment", "receivable", "unknown"]
     amount_ksh: Optional[float] = None
@@ -48,13 +43,8 @@ class CreditDecision(BaseModel):
     response_message: str
     timestamp: str
 
-# ---------------------------------------------------------------------------
-# SHARED LLM CALL HELPER (Groq / OpenAI compatible)
-# ---------------------------------------------------------------------------
 async def _call_llm(client, prompt: str, system: str = "") -> str:
-    """
-    Wraps the synchronous Groq/OpenAI chat completion call in asyncio.to_thread.
-    """
+    """Wraps synchronous Groq call in asyncio.to_thread."""
     def _blocking_call():
         response = client.chat.completions.create(
             model=MODEL_ID,
@@ -66,94 +56,46 @@ async def _call_llm(client, prompt: str, system: str = "") -> str:
             max_tokens=1500,
         )
         return response.choices[0].message.content
-
     return await asyncio.to_thread(_blocking_call)
 
-# ---------------------------------------------------------------------------
-# AGENT 1 — BIAS MITIGATION GUARDRAIL
-# ---------------------------------------------------------------------------
 BIAS_GUARDRAIL_SYSTEM = """
 You are a bias-mitigation filter for an AI credit system serving African informal economy workers.
-Your job is to:
-1. Extract typed trade events from the merchant's message
-2. Identify and remove ANY proxy variables that could introduce demographic bias
-3. Return ONLY structured JSON — no prose, no markdown, no preamble
-
-PROXY VARIABLES TO REMOVE:
-- Location names that signal ethnicity or socioeconomic status (replace with "market area")
-- Gender-coded business descriptors ("mama mboga" → "vegetable vendor")
-- Tribal/ethnic markers in any language
-- Religious time references that signal identity ("after Friday prayers" → "weekly")
-- Relative wealth signals ("my mud house" → strip entirely)
-
-TRADE EVENT TYPES:
-- revenue: money received from sales
-- expense: money paid out for business costs
-- inventory_in: stock/goods acquired
-- debt_repayment: paying back a loan or credit
-- receivable: money owed TO the merchant
-- unknown: cannot determine type with confidence
-
-Return this exact JSON structure:
+Extract typed trade events and remove demographic proxy variables (gender, ethnicity, location).
+Return ONLY structured JSON.
+TRADE EVENT TYPES: revenue, expense, inventory_in, debt_repayment, receivable, unknown.
+JSON Structure:
 {
-  "cleaned_text": "sanitized version of the input",
-  "detected_trade_events": [
-    {
-      "event_type": "revenue|expense|inventory_in|debt_repayment|receivable|unknown",
-      "amount_ksh": null or number,
-      "frequency_signal": null or "daily|weekly|market_day|irregular",
-      "confidence": 0.0-1.0,
-      "raw_utterance": "exact fragment from input",
-      "bias_flags": ["list of proxy variables removed from this event"]
-    }
-  ],
-  "language": "sw|en|luo|mixed",
+  "cleaned_text": "sanitized input",
+  "detected_trade_events": [{"event_type": "...", "amount_ksh": null or number, "frequency_signal": null or "daily|weekly|market_day|irregular", "confidence": 0.0-1.0, "raw_utterance": "...", "bias_flags": []}],
+  "language": "sw|en|mixed",
   "low_confidence_count": number,
   "overall_confidence": 0.0-1.0,
-  "bias_proxy_removed": ["complete list of all proxy variables removed"]
+  "bias_proxy_removed": ["list of proxies removed"]
 }
-
-CONFIDENCE RULES:
-- Set confidence < 0.6 if the amount is ambiguous or inferred
-- Set confidence < 0.5 if event_type is uncertain
-- Set overall_confidence = average of individual event confidences
-- If input has NO extractable trade events, return one event with type "unknown" and confidence 0.0
 """
 
-async def run_bias_mitigation_guardrail(
-    raw_message: str, merchant_id: str, language: str, ai_client=None
-) -> SanitizedInput:
+async def run_bias_mitigation_guardrail(raw_message: str, merchant_id: str, language: str, ai_client=None) -> SanitizedInput:
     if ai_client is None:
-        logger.warning(f"[{merchant_id}] Guardrail running without AI client — using fallback")
         return _guardrail_fallback(raw_message, language)
 
-    prompt = f"""
-Merchant message (language hint: {language}):
-\"\"\"
-{raw_message}
-\"\"\"
-Extract all trade events and apply bias filtering. Return only the JSON object.
-"""
+    prompt = f"Merchant message (language hint: {language}):\n\"\"\"\n{raw_message}\n\"\"\"\nExtract trade events and apply bias filtering. Return only JSON."
+    
     try:
         raw_response = await _call_llm(ai_client, prompt, system=BIAS_GUARDRAIL_SYSTEM)
-
-        # Bulletproof JSON extraction
         clean = raw_response.strip()
         start = clean.find('{')
         end = clean.rfind('}')
         if start != -1 and end != -1 and end > start:
             clean = clean[start:end+1]
         else:
-            raise ValueError("No JSON object found in response")
-
+            raise ValueError("No JSON object found")
+            
         data = json.loads(clean)
         sanitized = SanitizedInput(**data)
-
-        logger.info(f"[{merchant_id}] Guardrail: {len(sanitized.detected_trade_events)} events, confidence={sanitized.overall_confidence:.2f}, bias_removed={sanitized.bias_proxy_removed}")
+        logger.info(f"[{merchant_id}] Guardrail: {len(sanitized.detected_trade_events)} events, confidence={sanitized.overall_confidence:.2f}")
         return sanitized
-
     except Exception as e:
-        logger.error(f"[{merchant_id}] Guardrail parse error: {e} — using fallback")
+        logger.error(f"[{merchant_id}] Guardrail parse error: {e}")
         return _guardrail_fallback(raw_message, language)
 
 def _guardrail_fallback(raw_message: str, language: str) -> SanitizedInput:
@@ -163,119 +105,59 @@ def _guardrail_fallback(raw_message: str, language: str) -> SanitizedInput:
         language=language, low_confidence_count=1, overall_confidence=0.1, bias_proxy_removed=[]
     )
 
-# ---------------------------------------------------------------------------
-# AGENT 2 — KIPAJI UNDERWRITER CORE
-# ---------------------------------------------------------------------------
 UNDERWRITER_SYSTEM = """
-You are an AI credit underwriter for Kipaji, serving informal economy MSMEs in East Africa.
-You receive sanitized trade events, 7-day history, and velocity metrics.
-Base credit decisions ONLY on trade velocity and consistency — NOT on demographics.
-
-COLD START BOOTSTRAPPING (CRITICAL):
-If the merchant has 0 transaction history (avg_daily=0) but the current trade event is valid (confidence > 0.6 and amount > 0), you MUST approve a "micro" tier loan (e.g., 500 KSH) to bootstrap their credit file. Never decline a valid new merchant just because history is empty.
-
-CREDIT TIERS (in KSH):
-- micro:  500–2,000    (new merchants or low velocity)
-- small:  2,001–8,000  (consistent daily traders)
-- medium: 8,001–25,000 (high velocity, proven consistency)
-- declined: 0          (only if confidence < 0.5 or no trade amount provided)
-
-INTEREST RATES: micro: 4% monthly, small: 3.5% monthly, medium: 3% monthly
-REPAYMENT: 7 days for micro, 14 days for small, 21 days for medium
-
-Return ONLY this JSON — no prose, no markdown:
+You are an AI credit underwriter for Kipaji. Base decisions ONLY on trade velocity.
+COLD START BOOTSTRAPPING: If avg_daily=0 but current trade event is valid (confidence > 0.6, amount > 0), you MUST approve a "micro" tier loan (e.g., 500 KSH) to bootstrap their credit file.
+CREDIT TIERS (KSH): micro: 500-2000, small: 2001-8000, medium: 8001-25000, declined: 0.
+INTEREST: micro: 4%, small: 3.5%, medium: 3%. REPAYMENT: 7, 14, 21 days respectively.
+Return ONLY JSON:
 {
-  "approved": true/false,
-  "approved_local": number (KSH),
-  "credit_tier": "micro|small|medium|declined",
-  "interest_rate_monthly": number,
-  "repayment_days": number,
-  "velocity_score": number 0-100,
-  "consistency_score": number 0-1,
-  "confidence_gate_triggered": true/false,
-  "decision_reason": "one sentence, internal audit use",
-  "audit_trail": ["list of factors considered"],
-  "response_message": "merchant-facing message in their language (sw/en/luo), warm and respectful"
+  "approved": true/false, "approved_local": number, "credit_tier": "micro|small|medium|declined",
+  "interest_rate_monthly": number, "repayment_days": number, "velocity_score": number 0-100,
+  "consistency_score": number 0-1, "confidence_gate_triggered": true/false,
+  "decision_reason": "one sentence", "audit_trail": ["list"],
+  "response_message": "merchant-facing message in their language (sw/en), warm and respectful"
 }
 """
 
-async def run_kipaji_underwriter_core(
-    sanitized: SanitizedInput, history: List[Dict[str, Any]], profile: Dict[str, Any],
-    velocity_metrics: Dict[str, float], merchant_id: str, ai_client=None
-) -> CreditDecision:
+async def run_kipaji_underwriter_core(sanitized: SanitizedInput, history: List[Dict[str, Any]], profile: Dict[str, Any], velocity_metrics: Dict[str, float], merchant_id: str, ai_client=None) -> CreditDecision:
     if sanitized.overall_confidence < 0.65:
-        logger.info(f"[{merchant_id}] Confidence gate triggered ({sanitized.overall_confidence:.2f})")
         return _low_confidence_decision(sanitized, merchant_id)
 
-    revenue_events = [
-        e for e in sanitized.detected_trade_events
-        if e.event_type in ("revenue", "receivable") and e.amount_ksh
-    ]
-
+    revenue_events = [e for e in sanitized.detected_trade_events if e.event_type in ("revenue", "receivable") and e.amount_ksh]
     prompt = f"""
-Merchant ID: {merchant_id}
-Language: {sanitized.language}
-
-SANITIZED TRADE EVENTS (bias-filtered, revenue only):
-{json.dumps([e.model_dump() for e in revenue_events], indent=2)}
-
-7-DAY TRANSACTION HISTORY (last 10 entries):
-{json.dumps(history[-10:], indent=2)}
-
-COMPUTED VELOCITY METRICS:
-- avg_daily_ksh: {velocity_metrics.get('avg_daily', 0):.2f}
-- total_7d_ksh: {velocity_metrics.get('total_7d', 0):.2f}
-- consistency_score: {velocity_metrics.get('consistency', 1.0):.2f}
-
-MERCHANT PROFILE:
-{json.dumps(profile, indent=2)}
-
-Make a credit decision based solely on trade velocity signals. Return only the JSON object.
+Merchant ID: {merchant_id} | Language: {sanitized.language}
+EVENTS: {json.dumps([e.model_dump() for e in revenue_events])}
+HISTORY: {json.dumps(history[-10:])}
+METRICS: avg_daily={velocity_metrics.get('avg_daily', 0):.2f}, total_7d={velocity_metrics.get('total_7d', 0):.2f}, consistency={velocity_metrics.get('consistency', 1.0):.2f}
+Make a credit decision based solely on velocity signals. Return only JSON.
 """
 
     if ai_client is None:
-        logger.warning(f"[{merchant_id}] Underwriter running without AI client — using rule-based fallback")
         return _rule_based_decision(revenue_events, velocity_metrics, sanitized.language, merchant_id)
 
     try:
         raw_response = await _call_llm(ai_client, prompt, system=UNDERWRITER_SYSTEM)
-
-        # Bulletproof JSON extraction
         clean = raw_response.strip()
         start = clean.find('{')
         end = clean.rfind('}')
         if start != -1 and end != -1 and end > start:
             clean = clean[start:end+1]
         else:
-            raise ValueError("No JSON object found in response")
-
+            raise ValueError("No JSON object found")
+            
         data = json.loads(clean)
         data["timestamp"] = datetime.utcnow().isoformat()
         decision = CreditDecision(**data)
-
-        logger.info(f"[{merchant_id}] Decision: {decision.credit_tier} | KSH {decision.approved_local} | velocity={decision.velocity_score:.1f}")
+        logger.info(f"[{merchant_id}] Decision: {decision.credit_tier} | KSH {decision.approved_local}")
         return decision
-
     except Exception as e:
-        logger.error(f"[{merchant_id}] Underwriter parse error: {e} — using rule-based fallback")
+        logger.error(f"[{merchant_id}] Underwriter parse error: {e}")
         return _rule_based_decision(revenue_events, velocity_metrics, sanitized.language, merchant_id)
 
-# ---------------------------------------------------------------------------
-# FALLBACKS
-# ---------------------------------------------------------------------------
 def _low_confidence_decision(sanitized: SanitizedInput, merchant_id: str) -> CreditDecision:
-    lang = sanitized.language
-    if lang == "sw": msg = "Samahani, hatukuelewa vizuri. Tafadhali tuambie: uliuza nini leo na bei ngapi?"
-    elif lang == "luo": msg = "Kony, wawacho ne ok wawinjo maber. Nyiswa: ne icho ang'o kawuono kod nengo adi?"
-    else: msg = "Sorry, we couldn't understand your message clearly. Could you tell us: what did you sell today and for how much?"
-
-    return CreditDecision(
-        approved=False, approved_local=0, credit_tier="declined", interest_rate_monthly=0, repayment_days=0,
-        velocity_score=0, consistency_score=0, confidence_gate_triggered=True,
-        decision_reason=f"Confidence gate: overall_confidence={sanitized.overall_confidence:.2f}",
-        audit_trail=["Confidence below threshold 0.65", f"Low confidence events: {sanitized.low_confidence_count}"],
-        response_message=msg, timestamp=datetime.utcnow().isoformat()
-    )
+    msg = "Samahani, hatukuelewa vizuri. Tafadhali tuambie: uliuza nini leo na bei ngapi?" if sanitized.language == "sw" else "Sorry, we couldn't understand your message clearly. Could you tell us: what did you sell today and for how much?"
+    return CreditDecision(approved=False, approved_local=0, credit_tier="declined", interest_rate_monthly=0, repayment_days=0, velocity_score=0, consistency_score=0, confidence_gate_triggered=True, decision_reason=f"Confidence gate: overall_confidence={sanitized.overall_confidence:.2f}", audit_trail=["Confidence below threshold 0.65"], response_message=msg, timestamp=datetime.utcnow().isoformat())
 
 def _rule_based_decision(revenue_events: list, velocity_metrics: Dict[str, float], language: str, merchant_id: str) -> CreditDecision:
     avg_daily = velocity_metrics.get("avg_daily", 0)
@@ -288,15 +170,6 @@ def _rule_based_decision(revenue_events: list, velocity_metrics: Dict[str, float
     elif avg_daily >= 200 or (total_7d > 0 and len(revenue_events) > 0): tier, amount, rate, days = "micro", min(max(avg_daily * 1.5, 500), 2000), 4.0, 7
     else: tier, amount, rate, days = "declined", 0, 0, 0
 
-    if language == "sw": msg = f"Hongera! Umeidhinishiwa mkopo wa KSH {amount:,.0f} kwa siku {days}." if amount > 0 else "Samahani, hatuna taarifa za kutosha za biashara yako bado."
-    elif language == "luo": msg = f"Ber ahinya! Imiyo KSH {amount:,.0f} mar {days} ndalo." if amount > 0 else "Kony, weche mag ohala mago ok oromo."
-    else: msg = f"Approved! KSH {amount:,.0f} credit for {days} days." if amount > 0 else "We need a bit more trading history to approve credit."
-
-    return CreditDecision(
-        approved=amount > 0, approved_local=round(amount, 2), credit_tier=tier,
-        interest_rate_monthly=rate, repayment_days=days, velocity_score=round(velocity_score, 1),
-        consistency_score=round(consistency, 2), confidence_gate_triggered=False,
-        decision_reason=f"Rule-based fallback: avg_daily={avg_daily:.0f} KSH, consistency={consistency:.2f}",
-        audit_trail=[f"avg_daily_ksh={avg_daily:.2f}", f"total_7d_ksh={total_7d:.2f}", f"consistency={consistency:.2f}", f"revenue_events_count={len(revenue_events)}", "LLM unavailable — rule-based scoring used"],
-        response_message=msg, timestamp=datetime.utcnow().isoformat()
-    )
+    msg = f"Hongera! Umeidhinishiwa mkopo wa KSH {amount:,.0f} kwa siku {days}." if language == "sw" and amount > 0 else f"Approved! KSH {amount:,.0f} credit for {days} days." if amount > 0 else "We need more trading history."
+    
+    return CreditDecision(approved=amount > 0, approved_local=round(amount, 2), credit_tier=tier, interest_rate_monthly=rate, repayment_days=days, velocity_score=round(velocity_score, 1), consistency_score=round(consistency, 2), confidence_gate_triggered=False, decision_reason=f"Rule-based fallback", audit_trail=[f"avg_daily={avg_daily}"], response_message=msg, timestamp=datetime.utcnow().isoformat())

@@ -67,9 +67,21 @@ async def websocket_telemetry(websocket: WebSocket):
     except WebSocketDisconnect: telemetry_hub.disconnect(websocket)
 
 async def _emit_audit(event_type: str, merchant_id: str, data: Dict[str, Any]):
-    try: await telemetry_hub.broadcast({"event": event_type, "merchant_id": merchant_id, "timestamp": datetime.utcnow().isoformat(), **data})
-    except Exception: pass
-
+    """Fire-and-forget telemetry emission with explicit logging for debugging."""
+    try:
+        msg = {
+            "event": event_type, 
+            "merchant_id": merchant_id,
+            "timestamp": datetime.utcnow().isoformat(), 
+            **data
+        }
+        # THIS IS THE CRITICAL LOG LINE
+        logger.info(f"[Telemetry] Broadcasting to {len(telemetry_hub.active_connections)} connections: {msg}")
+        
+        await telemetry_hub.broadcast(msg)
+        logger.info(f"[Telemetry] Broadcast complete")
+    except Exception as e:
+        logger.error(f"[Telemetry] Broadcast failed: {e}")
 # --- HELPERS ---
 class GatewayMessage(BaseModel):
     merchant_id: str = Field(..., min_length=3)

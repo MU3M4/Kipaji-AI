@@ -1,25 +1,34 @@
 """
-main.py — Kipaji Core AI v4.0 (Hybrid AI & Live Dashboard Edition)
+main.py — Kipaji Core AI v4.0 (Hybrid AI, Live Dashboard & Fixed USSD)
 """
-import os, json, logging, asyncio
+import os
+import json
+import logging
+import asyncio
 from typing import Any, Dict, List
 from datetime import datetime
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from langdetect import detect, DetectorFactory
 
 load_dotenv()
+
+# Local modules (Ensure your storage.py is the pure in-memory version we discussed)
 from agents import run_bias_mitigation_guardrail, run_kipaji_underwriter_core, SanitizedInput
 from storage import get_merchant_data, save_trade_interaction
-from langdetect import detect, DetectorFactory
+
 DetectorFactory.seed = 0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger("KipajiCoreAI")
 
-# --- HYBRID AI CLIENTS ---
+# ---------------------------------------------------------------------------
+# HYBRID AI CLIENTS
+# ---------------------------------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -31,35 +40,59 @@ try:
         from google import genai
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         logger.info("Gemini AI client initialised (Agent 1: Bias Guardrail)")
-except Exception as e: logger.error(f"Gemini client init failed: {e}")
+except Exception as e:
+    logger.error(f"Gemini client init failed: {e}")
 
 try:
     if GROQ_API_KEY:
         from openai import OpenAI
         groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
         logger.info("Groq AI client initialised (Agent 2: Underwriter)")
-except Exception as e: logger.error(f"Groq client init failed: {e}")
+except Exception as e:
+    logger.error(f"Groq client init failed: {e}")
 
+# ---------------------------------------------------------------------------
+# APP & MIDDLEWARE
+# ---------------------------------------------------------------------------
 app = FastAPI(title="Kipaji Core AI", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# --- TELEMETRY HUB (WITH HISTORY CACHE) ---
+# ---------------------------------------------------------------------------
+# TELEMETRY HUB (WITH HISTORY CACHE FOR DASHBOARD)
+# ---------------------------------------------------------------------------
 telemetry_history = []
+MAX_HISTORY = 20
+
 class TelemetryHub:
-    def __init__(self): self.active_connections: List[WebSocket] = []
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+        
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
+        
     def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections: self.active_connections.remove(websocket)
+        if websocket in self.active_connections: 
+            self.active_connections.remove(websocket)
+            
     async def broadcast(self, message: Dict[str, Any]):
+        # 1. Save to history cache (persists even if 0 connections are live)
         telemetry_history.append(message)
-        if len(telemetry_history) > 20: telemetry_history.pop(0)
-        if not self.active_connections: return
+        if len(telemetry_history) > MAX_HISTORY:
+            telemetry_history.pop(0)
+            
+        # 2. Broadcast to live connections
+        if not self.active_connections: 
+            return
         payload = json.dumps(message, default=str)
+        dead = []
         for conn in self.active_connections[:]:
-            try: await conn.send_text(payload)
-            except Exception: self.disconnect(conn)
+            try: 
+                await conn.send_text(payload)
+            except Exception: 
+                dead.append(conn)
+        for ws in dead: 
+            self.disconnect(ws)
 
 telemetry_hub = TelemetryHub()
 
@@ -67,18 +100,26 @@ telemetry_hub = TelemetryHub()
 async def websocket_telemetry(websocket: WebSocket):
     await telemetry_hub.connect(websocket)
     try:
-        for msg in telemetry_history: await websocket.send_text(json.dumps(msg, default=str))
-        while True: await websocket.receive_text()
-    except WebSocketDisconnect: telemetry_hub.disconnect(websocket)
+        # INSTANTLY send the history to the new client upon connection!
+        for msg in telemetry_history:
+            await websocket.send_text(json.dumps(msg, default=str))
+            
+        while True: 
+            await websocket.receive_text()
+    except WebSocketDisconnect: 
+        telemetry_hub.disconnect(websocket)
 
 async def _emit_audit(event_type: str, merchant_id: str, data: Dict[str, Any]):
     try: 
         msg = {"event": event_type, "merchant_id": merchant_id, "timestamp": datetime.utcnow().isoformat(), **data}
         logger.info(f"[Telemetry] Broadcasting: {msg}")
         await telemetry_hub.broadcast(msg)
-    except Exception as e: logger.error(f"[Telemetry] Broadcast failed: {e}")
+    except Exception as e: 
+        logger.error(f"[Telemetry] Broadcast failed: {e}")
 
-# --- HELPERS ---
+# ---------------------------------------------------------------------------
+# HELPERS & LANGUAGE DETECTION (ENGLISH & SWAHILI ONLY)
+# ---------------------------------------------------------------------------
 class GatewayMessage(BaseModel):
     merchant_id: str = Field(..., min_length=3)
     phone_number: str = Field(..., pattern=r"^\+?[0-9]{9,15}$")
@@ -86,10 +127,14 @@ class GatewayMessage(BaseModel):
     message_body: str = Field(..., min_length=1)
 
 _SWAHILI_MARKERS = {"nimeuza", "niliuza", "nilinunua", "biashara", "bei", "leo", "shilingi", "pesa", "ksh"}
+_SHENG_MARKERS = {"niko na", "nimefanya", "chapaa", "fiti"}
+
 def detect_language(text: str) -> str:
     tokens = set(text.lower().split())
-    if tokens & _SWAHILI_MARKERS: return "sw"
-    try: return "sw" if detect(text[:400]) == "sw" else "en"
+    if tokens & _SWAHILI_MARKERS or tokens & _SHENG_MARKERS: return "sw"
+    try:
+        detected = detect(text[:400])
+        return "sw" if detected == "sw" else "en"
     except Exception: return "en"
 
 def calculate_velocity_metrics(history: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -111,7 +156,9 @@ def _extract_primary_trade_amount(sanitized: SanitizedInput) -> float:
     if not revenue_events: return 0.0
     return max(revenue_events, key=lambda e: e.confidence).amount_ksh
 
-# --- GATEWAYS ---
+# ---------------------------------------------------------------------------
+# GATEWAYS
+# ---------------------------------------------------------------------------
 @app.post("/api/v1/gateway")
 async def inbound_telecom_gateway(payload: GatewayMessage, background_tasks: BackgroundTasks):
     merchant_id = payload.merchant_id
@@ -119,23 +166,29 @@ async def inbound_telecom_gateway(payload: GatewayMessage, background_tasks: Bac
     merchant_data = await get_merchant_data(merchant_id)
     velocity_metrics = calculate_velocity_metrics(merchant_data["history"])
 
+    # HYBRID PIPELINE: Gemini for Guardrail, Groq for Underwriter
     sanitized = await run_bias_mitigation_guardrail(payload.message_body, merchant_id, user_lang, gemini_client)
     decision = await run_kipaji_underwriter_core(sanitized, merchant_data["history"], merchant_data["profile"], velocity_metrics, merchant_id, groq_client)
 
     background_tasks.add_task(save_trade_interaction, merchant_id, _extract_primary_trade_amount(sanitized), (sanitized.detected_trade_events[0].event_type if sanitized.detected_trade_events else "unknown"), decision.model_dump(), sanitized.bias_proxy_removed, user_lang)
     background_tasks.add_task(_emit_audit, "credit_decision", merchant_id, {"tier": decision.credit_tier, "approved_local": decision.approved_local, "bias_proxy_removed": sanitized.bias_proxy_removed, "audit_trail": decision.audit_trail})
+    
     return {"status": "SUCCESS", "merchant_id": merchant_id, "language_detected": user_lang, "credit_decision": decision.model_dump(), "velocity_metrics": velocity_metrics, "response_message": decision.response_message}
 
+# CRITICAL USSD FIX: Using PlainTextResponse to prevent JSON quote wrapping
 @app.post("/api/v1/ussd")
 async def ussd_gateway(request: Request, background_tasks: BackgroundTasks):
     form = await request.form()
     phone_number = form.get("phoneNumber", "")
     text = form.get("text", "")
     merchant_id = "m_" + phone_number.replace("+", "").replace(" ", "")
+    
+    # Stateless USSD Parser (Africa's Talking accumulates inputs with '*')
     parts = text.split('*') if text else []
     step = len(parts)
     
-    if step == 0: return PlainTextResponse("CON Welcome to Kipaji AI!\nBy continuing you agree to our terms.\n1. Opt In\n2. Opt Out")
+    if step == 0: 
+        return PlainTextResponse("CON Welcome to Kipaji AI!\nBy continuing you agree to our terms.\n1. Opt In\n2. Opt Out")
     if step == 1:
         if parts[0] != '1': return PlainTextResponse("END Thank you for trying Kipaji AI. Goodbye!")
         return PlainTextResponse("CON Choose your language:\n1. English\n2. Swahili")
@@ -151,20 +204,28 @@ async def ussd_gateway(request: Request, background_tasks: BackgroundTasks):
             
         merchant_data = await get_merchant_data(merchant_id)
         velocity_metrics = calculate_velocity_metrics(merchant_data["history"])
+        
         sanitized = await run_bias_mitigation_guardrail(trade_message, merchant_id, lang, gemini_client)
         decision = await run_kipaji_underwriter_core(sanitized, merchant_data["history"], merchant_data["profile"], velocity_metrics, merchant_id, groq_client)
         
         background_tasks.add_task(save_trade_interaction, merchant_id, _extract_primary_trade_amount(sanitized), (sanitized.detected_trade_events[0].event_type if sanitized.detected_trade_events else "unknown"), decision.model_dump(), sanitized.bias_proxy_removed, lang)
         background_tasks.add_task(_emit_audit, "ussd_credit_decision", merchant_id, {"tier": decision.credit_tier, "approved_local": decision.approved_local, "bias_proxy_removed": sanitized.bias_proxy_removed, "audit_trail": decision.audit_trail})
+        
         return PlainTextResponse(f"END {decision.response_message[:160]}")
+        
     return PlainTextResponse("END Session error. Please dial *384*63466# again.")
 
-# --- AUDIT ENDPOINT FOR JUDGES ---
+# ---------------------------------------------------------------------------
+# JUDGE AUDIT ENDPOINT
+# ---------------------------------------------------------------------------
 @app.get("/api/v1/decisions")
 async def get_audit_log():
+    """Returns the last 20 AI credit decisions for judge verification."""
     return {"total_decisions": len(telemetry_history), "recent_decisions": telemetry_history}
 
-# --- LIVE DASHBOARD ---
+# ---------------------------------------------------------------------------
+# LIVE DASHBOARD (HTML/JS)
+# ---------------------------------------------------------------------------
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -226,7 +287,7 @@ DASHBOARD_HTML = """
                 ? data.bias_proxy_removed.map(b => `<span class="bias-tag">Stripped: ${b}</span>`).join('') 
                 : '<span style="color:#2ecc71;">✅ No bias proxies detected</span>';
             entry.innerHTML = `
-                <div class="log-header">${isApproved ? '✅ APPROVED' : '❌ DECLINED'} | Merchant: ${data.merchant_id} | Tier: ${data.tier || 'N/A'} | Amount: KSH ${data.approved_local || 0}</div>
+                <div class="log-header">${isApproved ? '✅ APPROVED' : ' DECLINED'} | Merchant: ${data.merchant_id} | Tier: ${data.tier || 'N/A'} | Amount: KSH ${data.approved_local || 0}</div>
                 <div><strong>Bias Mitigation:</strong> ${biasTags}</div>
                 <div style="font-size:0.85em; color:#bdc3c7; margin-top:5px;"><strong>Audit Trail:</strong> ${(data.audit_trail || []).join(' • ')}</div>
             `;
@@ -240,7 +301,8 @@ DASHBOARD_HTML = """
 """
 
 @app.get("/", response_class=HTMLResponse)
-async def read_root(): return DASHBOARD_HTML
+async def read_root(): 
+    return DASHBOARD_HTML
 
 @app.get("/health")
 async def health_check():

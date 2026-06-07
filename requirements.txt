@@ -17,3 +17,5 @@ langdetect==1.0.9
 
 # Environment
 python-dotenv==1.0.1
+
+python-multipart

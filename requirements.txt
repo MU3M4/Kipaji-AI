@@ -5,8 +5,6 @@ uvicorn[standard]==0.30.6
 # AI Client (Groq uses the OpenAI standard)
 openai==1.55.0
 
-# Google Cloud (Keep Firestore just in case, but we rely on in-memory fallback)
-google-cloud-firestore==2.18.0
 
 # Data validation
 pydantic==2.9.2

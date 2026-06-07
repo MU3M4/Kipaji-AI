@@ -161,7 +161,7 @@ async def _emit_audit(event_type: str, merchant_id: str, data: Dict[str, Any]):
 # ---------------------------------------------------------------------------
 class GatewayMessage(BaseModel):
     merchant_id: str = Field(..., min_length=3, max_length=64)
-    phone_number: str = Field(..., pattern=r"^+?[0-9]{9,15}$")
+    phone_number: str = Field(..., pattern=r"^\+?[0-9]{9,15}$")
     channel: str = Field(..., pattern=r"^(whatsapp|sms|ussd|api)$")
     message_body: str = Field(..., min_length=1, max_length=2000)
 

@@ -1,3 +1,6 @@
+"""
+storage.py — Kipaji-AI data layer (Firestore + Redis with in-memory fallbacks)
+"""
 import json
 import logging
 import asyncio
@@ -6,12 +9,11 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("KipajiStorage")
 
-# --- IN-MEMORY FALLBACKS ---
 _MERCHANT_LEDGER: Dict[str, List[Dict[str, Any]]] = {}
 _MERCHANT_PROFILES: Dict[str, Dict[str, Any]] = {}
 _SESSION_STORE: Dict[str, Dict[str, Any]] = {}
+USSD_SESSION_TTL = 180
 
-# --- MERCHANT LEDGER ---
 async def get_merchant_data(merchant_id: str, db=None) -> Dict[str, Any]:
     if db is not None:
         try:
@@ -24,7 +26,6 @@ async def get_merchant_data(merchant_id: str, db=None) -> Dict[str, Any]:
             return await asyncio.to_thread(_read)
         except Exception as e:
             logger.error(f"[{merchant_id}] Firestore read error: {e}")
-            
     return {"history": _MERCHANT_LEDGER.get(merchant_id, []), "profile": _MERCHANT_PROFILES.get(merchant_id, {})}
 
 async def save_trade_interaction(merchant_id: str, extracted_trade_amount: float, event_type: str, decision_dict: Dict[str, Any], bias_removed: List[str], language: str, db=None) -> None:
@@ -33,7 +34,6 @@ async def save_trade_interaction(merchant_id: str, extracted_trade_amount: float
         "amount_local": extracted_trade_amount, "language": language, "bias_removed": bias_removed,
         "credit_decision": {"tier": decision_dict.get("credit_tier"), "approved_local": decision_dict.get("approved_local")}
     }
-    
     if db is not None:
         try:
             def _write():
@@ -43,12 +43,11 @@ async def save_trade_interaction(merchant_id: str, extracted_trade_amount: float
             return
         except Exception as e:
             logger.error(f"[{merchant_id}] Firestore write error: {e}")
-
+    
     if merchant_id not in _MERCHANT_LEDGER: _MERCHANT_LEDGER[merchant_id] = []
     _MERCHANT_LEDGER[merchant_id].append(entry)
     if len(_MERCHANT_LEDGER[merchant_id]) > 270: _MERCHANT_LEDGER[merchant_id] = _MERCHANT_LEDGER[merchant_id][-270:]
 
-# --- USSD SESSION STATE ---
 async def get_ussd_session(session_id: str, redis_client=None) -> Optional[Dict[str, Any]]:
     if redis_client is not None:
         try:
@@ -64,7 +63,7 @@ async def save_ussd_session(session_id: str, state: Dict[str, Any], redis_client
     state["last_updated"] = datetime.utcnow().isoformat()
     if redis_client is not None:
         try:
-            def _write(): redis_client.setex(f"ussd:{session_id}", 180, json.dumps(state))
+            def _write(): redis_client.setex(f"ussd:{session_id}", USSD_SESSION_TTL, json.dumps(state))
             await asyncio.to_thread(_write)
             return
         except Exception as e:

@@ -8,7 +8,7 @@ logger = logging.getLogger("KipajiStorage")
 
 # --- IN-MEMORY FALLBACKS ---
 _MERCHANT_LEDGER: Dict[str, List[Dict[str, Any]]] = {}
-_MERCHANT_PROFILES: Dict[str, Dict[str, Any]]] = {}
+_MERCHANT_PROFILES: Dict[str, Dict[str, Any]] = {}
 _SESSION_STORE: Dict[str, Dict[str, Any]] = {}
 
 # --- MERCHANT LEDGER ---

@@ -21,15 +21,12 @@ import os
 import json
 import logging
 import asyncio
-import base64
-import hashlib
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 
-import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException, Request, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -67,71 +64,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
-
-# M-PESA DARAJA API CONFIGURATION
-MPESA_CONSUMER_KEY = os.getenv("MPESA_CONSUMER_KEY")
-MPESA_CONSUMER_SECRET = os.getenv("MPESA_CONSUMER_SECRET")
-MPESA_SHORTCODE = os.getenv("MPESA_SHORTCODE", "174379")  # Sandbox default
-MPESA_PASSKEY = os.getenv("MPESA_PASSKEY")
-MPESA_CALLBACK_URL = os.getenv("MPESA_CALLBACK_URL", "https://kipaji-ai.onrender.com/api/v1/mpesa/callback")
-MPESA_ENV = os.getenv("MPESA_ENV", "sandbox")
-
-MPESA_BASE_URL = (
-    "https://api.safaricom.co.ke" if MPESA_ENV == "production" 
-    else "https://sandbox.safaricom.co.ke"
-)
-
-# =============================================================================
-# STATE & LEDGERS
-# =============================================================================
-_PAYMENT_LEDGER: Dict[str, Dict[str, Any]] = {}
-
-_DECISION_LOG: List[Dict[str, Any]] = []
-_DECISION_LOG_MAX = 500
-
-def log_credit_decision(
-    merchant_id: str,
-    channel: str,
-    language: str,
-    sanitized: SanitizedInput,
-    decision: CreditDecision,
-    velocity_metrics: Dict[str, float]
-):
-    """Builds and appends a structured audit log entry for every AI decision."""
-    timestamp = datetime.utcnow().isoformat()
-    hash_input = f"{merchant_id}{timestamp}"
-    decision_id = hashlib.sha256(hash_input.encode()).hexdigest()[:8]
-    
-    entry = {
-        "decision_id": decision_id,
-        "timestamp": timestamp,
-        "merchant_id": merchant_id,
-        "channel": channel,
-        "language_detected": language,
-        "agent_1_output": {
-            "overall_confidence": sanitized.overall_confidence,
-            "trade_events_extracted": len(sanitized.detected_trade_events),
-            "bias_proxies_removed": sanitized.bias_proxy_removed,
-            "low_confidence_events": sanitized.low_confidence_count
-        },
-        "confidence_gate_triggered": decision.confidence_gate_triggered,
-        "agent_2_output": {
-            "credit_tier": decision.credit_tier,
-            "approved_local_ksh": decision.approved_local,
-            "velocity_score": decision.velocity_score,
-            "consistency_score": decision.consistency_score,
-            "interest_rate_monthly_pct": decision.interest_rate_monthly,
-            "repayment_days": decision.repayment_days
-        },
-        "velocity_metrics_at_decision": velocity_metrics,
-        "decision_reason": decision.decision_reason,
-        "audit_trail": decision.audit_trail,
-        "approved": decision.approved
-    }
-    
-    _DECISION_LOG.append(entry)
-    if len(_DECISION_LOG) > _DECISION_LOG_MAX:
-        _DECISION_LOG.pop(0)
 
 # =============================================================================
 # CLIENTS
@@ -179,7 +111,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
+    allow_methods=["GET", "POST", "HEAD"],
     allow_headers=["*"],
 )
 
@@ -303,82 +235,6 @@ def _extract_primary_trade_amount(sanitized: SanitizedInput) -> float:
     best = max(revenue_events, key=lambda e: e.confidence)
     return best.amount_ksh
 
-def _format_mpesa_phone(phone: str) -> str:
-    """Format phone number to 254XXXXXXXXX for M-Pesa API."""
-    clean = phone.replace("+", "").replace(" ", "").replace("-", "")
-    if clean.startswith("254"):
-        return clean
-    if clean.startswith("0"):
-        return "254" + clean[1:]
-    return "254" + clean
-
-def _generate_mpesa_password(shortcode: str, passkey: str, timestamp: str) -> str:
-    """Generate base64-encoded password for M-Pesa STK Push."""
-    password_str = f"{shortcode}{passkey}{timestamp}"
-    return base64.b64encode(password_str.encode()).decode()
-
-# =============================================================================
-# M-PESA DARAJA API FUNCTIONS
-# =============================================================================
-async def get_mpesa_access_token() -> str:
-    """Fetches OAuth access token from Safaricom Daraja API."""
-    if not MPESA_CONSUMER_KEY or not MPESA_CONSUMER_SECRET:
-        raise ValueError("M-Pesa credentials not configured")
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(
-            f"{MPESA_BASE_URL}/oauth/v1/generate?grant_type=client_credentials",
-            auth=(MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET),
-            headers={"Accept": "application/json"}
-        )
-        if response.status_code != 200:
-            raise Exception(f"M-Pesa token fetch failed: {response.status_code} - {response.text}")
-        data = response.json()
-        if "access_token" not in data:
-            raise Exception(f"M-Pesa token response missing access_token: {data}")
-        return data["access_token"]
-
-async def trigger_mpesa_stk_push(phone_number: str, merchant_id: str, amount: int = 50) -> dict:
-    """Triggers M-Pesa STK Push (Paybill) for the processing fee."""
-    try:
-        access_token = await get_mpesa_access_token()
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        password = _generate_mpesa_password(MPESA_SHORTCODE, MPESA_PASSKEY, timestamp)
-        formatted_phone = _format_mpesa_phone(phone_number)
-        
-        payload = {
-            "BusinessShortCode": MPESA_SHORTCODE,
-            "Password": password,
-            "Timestamp": timestamp,
-            "TransactionType": "CustomerPayBillOnline",
-            "Amount": amount,
-            "PartyA": formatted_phone,
-            "PartyB": MPESA_SHORTCODE,
-            "PhoneNumber": formatted_phone,
-            "CallBackURL": MPESA_CALLBACK_URL,
-            "AccountReference": f"KIPAJI-{merchant_id[:8].upper()}",
-            "TransactionDesc": "Kipaji Credit Processing Fee"
-        }
-        
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{MPESA_BASE_URL}/mpesa/stkpush/v1/processrequest",
-                json=payload,
-                headers=headers
-            )
-            result = response.json()
-            logger.info(f"[{merchant_id}] M-Pesa STK Push triggered: {result.get('ResponseCode', 'N/A')}")
-            return result
-            
-    except Exception as e:
-        logger.error(f"[{merchant_id}] M-Pesa STK Push failed: {e}")
-        return {"error": str(e), "triggered": False}
-
 # =============================================================================
 # WEBSOCKET
 # =============================================================================
@@ -392,7 +248,7 @@ async def websocket_telemetry(websocket: WebSocket):
         telemetry_hub.disconnect(websocket)
 
 # =============================================================================
-# MAIN GATEWAY (WITH M-PESA FEE COLLECTION & DECISION LOGGING)
+# MAIN GATEWAY
 # =============================================================================
 @app.post("/api/v1/gateway")
 async def inbound_telecom_gateway(payload: GatewayMessage, background_tasks: BackgroundTasks):
@@ -452,38 +308,14 @@ async def inbound_telecom_gateway(payload: GatewayMessage, background_tasks: Bac
         },
     )
 
-    background_tasks.add_task(
-        log_credit_decision,
-        merchant_id=merchant_id,
-        channel=payload.channel,
-        language=user_lang,
-        sanitized=sanitized,
-        decision=decision,
-        velocity_metrics=velocity_metrics
-    )
-
-    # M-PESA FEE COLLECTION: Fire-and-forget on approved decisions
-    fee_collection_status = "not_applicable"
-    if decision.approved and MPESA_CONSUMER_KEY and MPESA_PASSKEY:
-        background_tasks.add_task(
-            trigger_mpesa_stk_push,
-            phone_number=payload.phone_number,
-            merchant_id=merchant_id,
-            amount=50
-        )
-        fee_collection_status = "initiated"
-
-    response = {
+    return {
         "status": "SUCCESS",
         "merchant_id": merchant_id,
         "language_detected": user_lang,
         "credit_decision": decision.model_dump(),
         "velocity_metrics": velocity_metrics,
         "response_message": decision.response_message,
-        "fee_collection": fee_collection_status,
     }
-    
-    return response
 
 # =============================================================================
 # USSD GATEWAY (FIXED: PlainTextResponse)
@@ -538,17 +370,6 @@ async def ussd_gateway(request: Request, background_tasks: BackgroundTasks):
             ai_client=ai_client,
         )
 
-        # Log decision BEFORE returning response
-        background_tasks.add_task(
-            log_credit_decision,
-            merchant_id=merchant_id,
-            channel="ussd",
-            language=user_lang,
-            sanitized=sanitized,
-            decision=decision,
-            velocity_metrics=velocity_metrics
-        )
-
         if decision.confidence_gate_triggered:
             session["step"] = 2
             session["partial_message"] = trade_message
@@ -557,26 +378,21 @@ async def ussd_gateway(request: Request, background_tasks: BackgroundTasks):
             return PlainTextResponse(f"CON {clarification}\n\nJibu: ")
 
         extracted_amount = _extract_primary_trade_amount(sanitized)
-        bg_tasks = [
-            save_trade_interaction(
-                merchant_id=merchant_id,
-                extracted_trade_amount=extracted_amount,
-                event_type=(sanitized.detected_trade_events[0].event_type
-                            if sanitized.detected_trade_events else "unknown"),
-                decision_dict=decision.model_dump(),
-                bias_removed=sanitized.bias_proxy_removed,
-                language=user_lang,
-                db=db,
-            ),
-            _emit_audit("ussd_credit_decision", merchant_id,
-                       {"tier": decision.credit_tier, "approved_local": decision.approved_local}),
-        ]
-        
-        if decision.approved and MPESA_CONSUMER_KEY and MPESA_PASSKEY:
-            bg_tasks.append(trigger_mpesa_stk_push(phone_number, merchant_id, 50))
-            
-        for task in bg_tasks:
-            background_tasks.add_task(task)
+        background_tasks.add_task(
+            save_trade_interaction,
+            merchant_id=merchant_id,
+            extracted_trade_amount=extracted_amount,
+            event_type=(sanitized.detected_trade_events[0].event_type
+                        if sanitized.detected_trade_events else "unknown"),
+            decision_dict=decision.model_dump(),
+            bias_removed=sanitized.bias_proxy_removed,
+            language=user_lang,
+            db=db,
+        )
+        background_tasks.add_task(
+            _emit_audit, "ussd_credit_decision", merchant_id,
+            {"tier": decision.credit_tier, "approved_local": decision.approved_local},
+        )
 
         await clear_ussd_session(session_id, redis_client=redis_client)
         result_msg = decision.response_message[:160]
@@ -597,16 +413,6 @@ async def ussd_gateway(request: Request, background_tasks: BackgroundTasks):
             velocity_metrics, merchant_id, ai_client
         )
 
-        background_tasks.add_task(
-            log_credit_decision,
-            merchant_id=merchant_id,
-            channel="ussd",
-            language=user_lang,
-            sanitized=sanitized,
-            decision=decision,
-            velocity_metrics=velocity_metrics
-        )
-
         extracted_amount = _extract_primary_trade_amount(sanitized)
         background_tasks.add_task(
             save_trade_interaction, merchant_id, extracted_amount,
@@ -621,164 +427,6 @@ async def ussd_gateway(request: Request, background_tasks: BackgroundTasks):
     return PlainTextResponse("END Kuna tatizo. Tafadhali piga *384# tena.")
 
 # =============================================================================
-# M-PESA CALLBACK ENDPOINT
-# =============================================================================
-@app.post("/api/v1/mpesa/callback")
-async def mpesa_callback(request: Request):
-    """Handles Daraja API callback for STK Push payment confirmation."""
-    try:
-        body = await request.json()
-        stk_callback = body.get("Body", {}).get("stkCallback", {})
-        
-        merchant_request_id = stk_callback.get("MerchantRequestID")
-        checkout_request_id = stk_callback.get("CheckoutRequestID")
-        result_code = stk_callback.get("ResultCode")
-        result_desc = stk_callback.get("ResultDesc")
-        
-        callback_metadata = stk_callback.get("CallbackMetadata", {}).get("Item", [])
-        metadata_dict = {item["Name"]: item["Value"] for item in callback_metadata} if callback_metadata else {}
-        
-        amount = metadata_dict.get("Amount")
-        mpesa_receipt = metadata_dict.get("MpesaReceiptNumber")
-        phone = metadata_dict.get("PhoneNumber")
-        
-        merchant_id = f"m_{phone}" if phone else "unknown"
-        
-        payment_record = {
-            "merchant_request_id": merchant_request_id,
-            "checkout_request_id": checkout_request_id,
-            "result_code": result_code,
-            "result_desc": result_desc,
-            "amount": amount,
-            "mpesa_receipt": mpesa_receipt,
-            "phone": phone,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-        
-        if result_code == 0:
-            if mpesa_receipt:
-                _PAYMENT_LEDGER[mpesa_receipt] = payment_record
-            await _emit_audit("mpesa_payment_confirmed", merchant_id, payment_record)
-            logger.info(f"[{merchant_id}] M-Pesa payment confirmed: {mpesa_receipt} - KSH {amount}")
-        else:
-            await _emit_audit("mpesa_payment_failed", merchant_id, payment_record)
-            logger.warning(f"[{merchant_id}] M-Pesa payment failed: {result_desc}")
-            
-    except Exception as e:
-        logger.error(f"M-Pesa callback processing error: {e}")
-    
-    # Safaricom requires this exact response format
-    return JSONResponse(content={"ResultCode": 0, "ResultDesc": "Accepted"})
-
-# =============================================================================
-# PAYMENTS & DECISIONS ENDPOINTS (EVIDENCE FOR JUDGES)
-# =============================================================================
-@app.get("/api/v1/payments/summary")
-async def get_payments_summary():
-    """Returns revenue evidence for hackathon judges."""
-    confirmed = [p for p in _PAYMENT_LEDGER.values() if p.get("result_code") == 0]
-    total_revenue = sum(p.get("amount", 0) for p in confirmed)
-    
-    return {
-        "total_confirmed_payments": len(confirmed),
-        "total_revenue_ksh": round(total_revenue, 2),
-        "recent_payments": list(_PAYMENT_LEDGER.values())[-10:],
-        "currency": "KSH",
-        "fee_per_transaction": 50,
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-
-@app.get("/api/v1/decisions")
-async def get_audit_log(
-    limit: int = Query(20, le=100),
-    approved_only: bool = False,
-    channel: Optional[str] = None
-):
-    filtered_log = _DECISION_LOG[:]
-    
-    if approved_only:
-        filtered_log = [d for d in filtered_log if d["approved"]]
-        
-    if channel:
-        filtered_log = [d for d in filtered_log if d["channel"] == channel]
-        
-    filtered_log = list(reversed(filtered_log))
-    
-    total_decisions = len(_DECISION_LOG)
-    total_approved = sum(1 for d in _DECISION_LOG if d["approved"])
-    total_declined = total_decisions - total_approved
-    approval_rate_pct = round((total_approved / total_decisions * 100), 1) if total_decisions > 0 else 0.0
-    
-    return {
-        "total_decisions": total_decisions,
-        "total_approved": total_approved,
-        "total_declined": total_declined,
-        "approval_rate_pct": approval_rate_pct,
-        "decisions": filtered_log[:limit]
-    }
-
-@app.get("/api/v1/decisions/summary")
-async def get_decisions_summary():
-    total = len(_DECISION_LOG)
-    approved = sum(1 for d in _DECISION_LOG if d["approved"])
-    declined = total - approved
-    approval_rate = round((approved / total * 100), 1) if total > 0 else 0.0
-    
-    conf_gates = sum(1 for d in _DECISION_LOG if d["confidence_gate_triggered"])
-    
-    approved_decisions = [d for d in _DECISION_LOG if d["approved"]]
-    avg_velocity = round(sum(d["agent_2_output"]["velocity_score"] for d in approved_decisions) / len(approved_decisions), 2) if approved_decisions else 0.0
-    avg_amount = round(sum(d["agent_2_output"]["approved_local_ksh"] for d in approved_decisions) / len(approved_decisions), 2) if approved_decisions else 0.0
-    
-    bias_total = sum(len(d["agent_1_output"]["bias_proxies_removed"]) for d in _DECISION_LOG)
-    
-    by_channel = {"whatsapp": 0, "ussd": 0, "sms": 0, "api": 0}
-    by_tier = {"micro": 0, "small": 0, "medium": 0, "declined": 0}
-    by_language = {"sw": 0, "en": 0, "mixed": 0}
-    
-    for d in _DECISION_LOG:
-        ch = d["channel"]
-        if ch in by_channel: by_channel[ch] += 1
-        
-        tier = d["agent_2_output"]["credit_tier"]
-        if tier in by_tier: by_tier[tier] += 1
-        
-        lang = d.get("language_detected", "en")
-        if lang in by_language:
-            by_language[lang] += 1
-        else:
-            by_language["mixed"] += 1
-
-    unique_bias_removals = []
-    seen = set()
-    for d in reversed(_DECISION_LOG):
-        proxies = d["agent_1_output"]["bias_proxies_removed"]
-        if proxies:
-            tup = tuple(proxies)
-            if tup not in seen:
-                seen.add(tup)
-                unique_bias_removals.append(proxies)
-                if len(unique_bias_removals) == 5:
-                    break
-                    
-    return {
-        "system_summary": {
-            "total_decisions_all_time": total,
-            "total_approved": approved,
-            "total_declined": declined,
-            "approval_rate_pct": approval_rate,
-            "confidence_gates_triggered": conf_gates,
-            "avg_velocity_score": avg_velocity,
-            "avg_approved_amount_ksh": avg_amount,
-            "bias_proxies_removed_total": bias_total
-        },
-        "by_channel": by_channel,
-        "by_tier": by_tier,
-        "by_language": by_language,
-        "recent_bias_removals": unique_bias_removals
-    }
-
-# =============================================================================
 # UTILITY ENDPOINTS
 # =============================================================================
 @app.get("/")
@@ -790,8 +438,6 @@ def read_root():
         "gemini": "connected" if ai_client else "unavailable (rule-based fallback active)",
         "firestore": "connected" if db else "unavailable (in-memory fallback active)",
         "redis": "connected" if redis_client else "unavailable (in-memory sessions active)",
-        "mpesa": "configured" if (MPESA_CONSUMER_KEY and MPESA_PASSKEY) else "not_configured",
-        "total_ai_decisions_logged": len(_DECISION_LOG),
     }
 
 # FIXED: Accept both GET and HEAD requests for UptimeRobot
@@ -800,7 +446,6 @@ async def health_check():
     checks = {
         "api": True,
         "gemini_configured": bool(GEMINI_API_KEY),
-        "mpesa_configured": bool(MPESA_CONSUMER_KEY and MPESA_PASSKEY),
     }
     return {"healthy": True, "checks": checks, "timestamp": datetime.utcnow().isoformat()}
 
